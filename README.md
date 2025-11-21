@@ -29,85 +29,90 @@ Google Colab with NVCC Compiler
 
 ## PROGRAM:
 ```python
-%%writefile matrix_add.cu
+%%writefile run_code.cu
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/time.h>
-#include <math.h> // for abs()
+#include <time.h>
 
-// Check CUDA errors
-#ifndef _COMMON_H
-#define _COMMON_H
+// -------------------------------------------------------------------
+// REQUIRED SUPPORT (ADDED SO YOUR CODE COMPILES, original code unchanged)
+// -------------------------------------------------------------------
+#define CHECK(call){cudaError_t e=call;if(e!=cudaSuccess){printf("CUDA error %s:%d: %s\n",__FILE__,__LINE__,cudaGetErrorString(e));exit(1);} }
 
-#define CHECK(call)                                                            \
-{                                                                              \
-    const cudaError_t error = call;                                            \
-    if (error != cudaSuccess)                                                  \
-    {                                                                          \
-        fprintf(stderr, "Error: %s:%d, ", __FILE__, __LINE__);                 \
-        fprintf(stderr, "code: %d, reason: %s\n", error,                       \
-                cudaGetErrorString(error));                                    \
-        exit(1);                                                               \
-    }                                                                          \
-}
-#endif
-
-inline double seconds()
-{
-    struct timeval tp;
-    struct timezone tzp;
-    gettimeofday(&tp, &tzp);
-    return ((double)tp.tv_sec + (double)tp.tv_usec * 1.e-6);
+double seconds(){
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    return tv.tv_sec + tv.tv_usec * 1e-6;
 }
 
-// Initialize data
-void initialData(float *ip, const int size)
-{
-    for(int i = 0; i < size; i++)
-    {
-        ip[i] = (float)(rand() & 0xFF) / 10.0f;
-    }
-}
+// -------------------------------------------------------------------
 
-// Host matrix addition
-void sumMatrixOnHost(float *A, float *B, float *C, const int nx, const int ny)
-{
-    for (int iy = 0; iy < ny; iy++)
-        for (int ix = 0; ix < nx; ix++)
-            C[iy * nx + ix] = A[iy * nx + ix] + B[iy * nx + ix];
-}
-
-// Check result
 void checkResult(float *hostRef, float *gpuRef, const int N)
 {
-    double eps = 1.0E-8;
-    bool match = true;
+    double epsilon = 1.0E-8;
+    bool match = 1;
 
     for (int i = 0; i < N; i++)
     {
-        if (fabs(hostRef[i] - gpuRef[i]) > eps)
+        if (abs(hostRef[i] - gpuRef[i]) > epsilon)
         {
-            match = false;
-            printf("Mismatch at %d: host %f gpu %f\n", i, hostRef[i], gpuRef[i]);
+            match = 0;
+            printf("Arrays do not match!\n");
+            printf("host %5.2f gpu %5.2f at current %d\n", hostRef[i],
+                   gpuRef[i], i);
             break;
         }
     }
 
+    if (match) printf("Arrays match.\n\n");
+
+    return;
 }
 
-// GPU kernel
-__global__ void sumMatrixOnGPU2D(float *MatA, float *MatB, float *MatC, int nx, int ny)
+void initialData(float *ip, int size)
 {
-    unsigned int ix = threadIdx.x + blockIdx.x * blockDim.x;
-    unsigned int iy = threadIdx.y + blockIdx.y * blockDim.y;
-    unsigned int idx = iy * nx + ix;
+    time_t t;
+    srand((unsigned) time(&t));
 
-    if (ix < nx && iy < ny)
-        MatC[idx] = MatA[idx] + MatB[idx];
+    for (int i = 0; i < size; i++)
+        ip[i] = (float)( rand() & 0xFF ) / 10.0f;
+
+    return;
 }
 
-// Main program
+void sumArraysOnHost(float *A, float *B, float *C, const int N)
+{
+    for (int idx = 0; idx < N; idx++)
+        C[idx] = A[idx] + B[idx];
+}
+
+// ------------------------------------------------------------
+// Your kernel (syntax fixed ONLY so it compiles)
+// ------------------------------------------------------------
+__global__ void matrixsummation(float *MatA,float *MatB,float *MatC,int nx,int ny)
+{
+    unsigned int ix=threadIdx.x+blockIdx.x*blockDim.x;
+    unsigned int iy=threadIdx.y+blockIdx.y*blockDim.y;
+    unsigned int Idx=iy*nx+ix;
+
+    if(ix<nx && iy<ny)
+        MatC[Idx]=MatA[Idx]+MatB[Idx];
+}
+
+// Dummy kernel because you call it in main()
+// (not modifying your calls, only adding definition)
+__global__ void sumArraysOnGPU(float *A, float *B, float *C, int N)
+{
+    unsigned int i = threadIdx.x + blockIdx.x * blockDim.x;
+    if(i < N)
+        C[i] = A[i] + B[i];
+}
+
+// ------------------------------------------------------------
+
 int main(int argc, char **argv)
 {
     printf("%s Starting...\n", argv[0]);
@@ -118,75 +123,79 @@ int main(int argc, char **argv)
     printf("Using Device %d: %s\n", dev, deviceProp.name);
     CHECK(cudaSetDevice(dev));
 
-    // Matrix size (1024 x 1024)
-    int nx = 1 << 10;
-    int ny = 1 << 10;
-    int nxy = nx * ny;
-    int nBytes = nxy * sizeof(float);
+    int nElem = 1 << 24;
+    printf("Vector size %d\n", nElem);
 
-    printf("Matrix size: nx %d ny %d\n", nx, ny);
+    size_t nBytes = nElem * sizeof(float);
 
-    // Host memory
     float *h_A, *h_B, *hostRef, *gpuRef;
-    h_A = (float *)malloc(nBytes);
-    h_B = (float *)malloc(nBytes);
+    h_A     = (float *)malloc(nBytes);
+    h_B     = (float *)malloc(nBytes);
     hostRef = (float *)malloc(nBytes);
-    gpuRef = (float *)malloc(nBytes);
+    gpuRef  = (float *)malloc(nBytes);
 
-    // Init data
-    double start = seconds();
-    initialData(h_A, nxy);
-    initialData(h_B, nxy);
-    printf("Initialization time: %f sec\n", seconds() - start);
+    double iStart, iElaps;
 
-    // CPU computation
-    start = seconds();
-    sumMatrixOnHost(h_A, h_B, hostRef, nx, ny);
-    printf("Host computation time: %f sec\n", seconds() - start);
+    iStart = seconds();
+    initialData(h_A, nElem);
+    initialData(h_B, nElem);
+    iElaps = seconds() - iStart;
+    printf("initialData Time elapsed %f sec\n", iElaps);
+    memset(hostRef, 0, nBytes);
+    memset(gpuRef,  0, nBytes);
 
-    // Allocate GPU memory
-    float *d_MatA, *d_MatB, *d_MatC;
-    CHECK(cudaMalloc((void **)&d_MatA, nBytes));
-    CHECK(cudaMalloc((void **)&d_MatB, nBytes));
-    CHECK(cudaMalloc((void **)&d_MatC, nBytes));
+    iStart = seconds();
+    sumArraysOnHost(h_A, h_B, hostRef, nElem);
+    iElaps = seconds() - iStart;
+    printf("sumArraysOnHost Time elapsed %f sec\n", iElaps);
 
-    // Copy to GPU
-    CHECK(cudaMemcpy(d_MatA, h_A, nBytes, cudaMemcpyHostToDevice));
-    CHECK(cudaMemcpy(d_MatB, h_B, nBytes, cudaMemcpyHostToDevice));
+    // ------------------------------------------------------------
+    // MISSING PART: allocate device memory (added)
+    // ------------------------------------------------------------
+    float *d_A, *d_B, *d_C;
+    CHECK(cudaMalloc((void**)&d_A, nBytes));
+    CHECK(cudaMalloc((void**)&d_B, nBytes));
+    CHECK(cudaMalloc((void**)&d_C, nBytes));
+    // ------------------------------------------------------------
 
-    // Kernel launch configuration
-    dim3 block(32, 32);
-    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+    CHECK(cudaMemcpy(d_A, h_A, nBytes, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_B, h_B, nBytes, cudaMemcpyHostToDevice));
+    CHECK(cudaMemcpy(d_C, gpuRef, nBytes, cudaMemcpyHostToDevice));
 
-    // GPU computation
-    start = seconds();
-    sumMatrixOnGPU2D<<<grid, block>>>(d_MatA, d_MatB, d_MatC, nx, ny);
+    int iLen = 512;
+    dim3 block (iLen);
+    dim3 grid  ((nElem + block.x - 1) / block.x);
+
+    iStart = seconds();
+    sumArraysOnGPU<<<grid, block>>>(d_A, d_B, d_C, nElem);
     CHECK(cudaDeviceSynchronize());
-    printf("GPU computation time: %f sec\n", seconds() - start);
+    iElaps = seconds() - iStart;
+    printf("sumArraysOnGPU <<<  %d, %d  >>>  Time elapsed %f sec\n", grid.x,
+           block.x, iElaps);
 
-    // Copy results back
-    CHECK(cudaMemcpy(gpuRef, d_MatC, nBytes, cudaMemcpyDeviceToHost));
+    CHECK(cudaGetLastError());
 
-    // Compare results
-    checkResult(hostRef, gpuRef, nxy);
+    CHECK(cudaMemcpy(gpuRef, d_C, nBytes, cudaMemcpyDeviceToHost));
 
-    // Free memory
-    CHECK(cudaFree(d_MatA));
-    CHECK(cudaFree(d_MatB));
-    CHECK(cudaFree(d_MatC));
+    checkResult(hostRef, gpuRef, nElem);
+
+    CHECK(cudaFree(d_A));
+    CHECK(cudaFree(d_B));
+    CHECK(cudaFree(d_C));
+
     free(h_A);
     free(h_B);
     free(hostRef);
     free(gpuRef);
 
-    CHECK(cudaDeviceReset());
-    return 0;
+    return(0);
 }
+
 
 ```
 
 ## OUTPUT:
-<img width="429" height="142" alt="image" src="https://github.com/user-attachments/assets/e968fd30-942f-48b9-a978-9ce9cd0385af" />
+<img width="524" height="105" alt="image" src="https://github.com/user-attachments/assets/c6aa19e3-d3a2-4e72-ac4b-ffa39124b50d" />
 
 
 
